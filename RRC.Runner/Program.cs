@@ -8,7 +8,7 @@ CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
 try
 {
     //Selevt the policy here:
-    RRC.Abstractions.IRequestPolicy requestPolicy = new SampleRequestPolicy();
+    RRC.Abstractions.IRequestPolicy requestPolicy = new AdaptiveRequestPolicy();
 
     var options = RunnerConsole.ReadOptions(args);
     if (options is null) return 0;
