@@ -2,30 +2,6 @@ using RRC.Abstractions;
 
 namespace RRC.Student;
 
-// Adaptive timeout/retry policy.
-//
-// Key property of the system: a timeout does not cancel the server work. Every retry is an extra attempt
-// that occupies the server, so retries are useful only against random slow outliers and harmful when
-// requests are slow because of load. The policy therefore tries to keep timeouts rare unless the
-// statistics clearly show that restarting a slow attempt is faster.
-//
-// 1. Recent attempt results are kept in a sliding window. A success gives an exact latency,
-//    a timeout gives a censored value ("latency >= timeout"), because late responses are not reported.
-// 2. The latency distribution is estimated with the Kaplan-Meier estimator, which handles censored values.
-// 3. For every candidate timeout T the expected time to success with immediate restarts is computed:
-//    E(T) = integral(0..T) S(t) dt / (1 - S(T)). Restarts are used only if they give a noticeable gain,
-//    then the largest T whose E(T) is close to the minimum is chosen (fewer retries for the same latency).
-//    Otherwise the timeout is set well above all observed latencies and only protects against outliers.
-// 4. The restart formula assumes attempts are independent. The policy checks it twice:
-//    - slow first attempts must not come in clusters of neighbouring requests (a cluster means
-//      the slowness is caused by load or by the current period of time, not by bad luck);
-//    - real retries must be fast as often as predicted, otherwise restarts are switched off.
-// 5. A fast guard watches the timeout rate of first attempts. If it suddenly grows (degradation, overload),
-//    the timeout is increased immediately, old statistics are dropped and retries get backoff with jitter,
-//    so the policy does not create a retry storm.
-// 6. The timeout grows immediately but decreases slowly: fast responses always arrive first,
-//    so fresh statistics are optimistic while slow attempts are still in flight.
-// 7. A request is never abandoned early: each next attempt gets a twice longer timeout.
 public sealed class AdaptiveRequestPolicy : IRequestPolicy
 {
     private const int WindowSize = 600;
@@ -36,7 +12,6 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
     private const double MinTimeoutMs = 1;
     private const double MaxTimeoutMs = 60_000;
 
-    // Restarts must reduce the expected latency at least by 10%, otherwise they are not worth the load.
     private const double RequiredGain = 0.9;
     private const double NearOptimum = 1.05;
     private const double MaxRestartShare = 0.15;
@@ -97,8 +72,6 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
             return RetryDecision.NoRetry();
         }
 
-        // Isolated slow attempts are restarted immediately: waiting only adds latency.
-        // When many attempts time out the server is likely overloaded, so retries are spread out.
         if (!IsOverloaded())
         {
             return RetryDecision.RetryAfter(TimeSpan.Zero);
@@ -125,7 +98,6 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
             return;
         }
 
-        // Latency has shifted up: the old statistics describe another regime and would pull the timeout down.
         sinceGuard = 0;
         timeoutMs = Math.Min(timeoutMs * GuardGrowth, MaxTimeoutMs);
         expectedTimeoutRate = 0;
@@ -138,7 +110,6 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
     {
         retryFastRate += RetryCheckAlpha * ((fast ? 1 : 0) - retryFastRate);
         retriesChecked++;
-        // For independent attempts a retry finishes within the base timeout with probability 1 - S(T).
         if (retriesChecked >= RetryCheckMinCount && retryFastRate < 0.5 * (1 - expectedTimeoutRate))
         {
             restartsTrusted = false;
@@ -156,7 +127,6 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
     {
         var samples = new Sample[windowCount];
         Array.Copy(window, samples, windowCount);
-        // Successes go before timeouts with the same value, as Kaplan-Meier requires.
         Array.Sort(samples, (a, b) => a.Value != b.Value ? a.Value.CompareTo(b.Value) : a.Censored.CompareTo(b.Censored));
 
         var candidates = new List<Candidate>();
@@ -181,17 +151,14 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
 
         if (candidates.Count == 0)
         {
-            // Too many attempts time out: the timeout is far below the real latency.
             timeoutMs = Math.Min(timeoutMs * 2, MaxTimeoutMs);
             expectedTimeoutRate = 0;
             return;
         }
 
-        // Without restarts the mean latency is at least the area under S up to the largest observed value.
         double noRestartLatency = area;
         var last = candidates[^1];
         double best = candidates.Min(candidate => candidate.ExpectedLatency);
-        // Among nearly optimal timeouts the largest one gives fewer retries and less extra load.
         var chosen = candidates.Last(candidate => candidate.ExpectedLatency <= best * NearOptimum);
 
         if (restartsTrusted && best < RequiredGain * noRestartLatency && !IsClustered(samples, chosen.Value))
@@ -201,8 +168,6 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
         }
         else
         {
-            // Restarting does not help: keep the timeout above everything observed so far,
-            // so it only catches rare outliers and the tail stays visible.
             SetTimeout(last.Value * TailMargin);
             expectedTimeoutRate = last.Survival;
         }
@@ -211,8 +176,6 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
     private void SetTimeout(double value) =>
         timeoutMs = Math.Clamp(Math.Max(value, timeoutMs * MaxDecrease), MinTimeoutMs, MaxTimeoutMs);
 
-    // Compares the chance that the next request is slow after a slow one with the overall chance.
-    // For independent latencies they are equal; load spikes and degradations make slow requests neighbours.
     private static bool IsClustered(Sample[] samples, double threshold)
     {
         var first = samples.Where(sample => sample.Attempt == 1).OrderBy(sample => sample.RequestId).ToArray();
@@ -224,8 +187,7 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
             {
                 slow++;
             }
-            // Only really consecutive requests are compared: slow answers arrive late, so the window
-            // also holds old slow requests whose neighbours have already left it.
+
             if (i == 0 || first[i].RequestId != first[i - 1].RequestId + 1)
             {
                 continue;
@@ -240,7 +202,6 @@ public sealed class AdaptiveRequestPolicy : IRequestPolicy
                 slowAfterSlow++;
             }
         }
-        // A few neighbouring slow requests can happen by chance, a cluster needs several of them.
         if (slowAfterSlow < MinClusterEvidence)
         {
             return false;
